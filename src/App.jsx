@@ -16,6 +16,11 @@ const supa = {
   async upsertSub(sub, token) { await fetch(`${SUPA_URL}/rest/v1/subscriptions`, { method: "POST", headers: { ...supa.h(token), "Prefer": "resolution=merge-duplicates,return=representation" }, body: JSON.stringify(sub) }); }
 };
 
+const STRIPE_PRICES = {
+  recommended: { month: "price_1T6uWRGkn6GFBDzBmxvciJy8", year: "price_1T6uXLGkn6GFBDzBqnM07b3G" },
+  premium:     { month: "price_1T6uYMGkn6GFBDzBbIBUglOg", year: "price_1T6uZqGkn6GFBDzBtepmvbzn" },
+};
+
 const PLANS = {
   free: { id: "free", label: "Free Trial", badge: null, priceMonth: 0, priceYear: 0, color: "#7C9A8A", description: "Get started with the basics", features: ["Up to 5 tasks", "2 categories", "Basic priority labels", "No AI Coach"], limits: { maxTasks: 5, aiMessages: 0, categories: ["Work", "Personal"], analytics: false } },
   recommended: { id: "recommended", label: "Recommended", badge: "MOST POPULAR", priceMonth: 7, priceYear: 75, color: "#C9914A", description: "For people serious about their time", features: ["Unlimited tasks", "All 5 categories", "AI Coach (20 msg/day)", "Time estimates & tracking"], limits: { maxTasks: Infinity, aiMessages: 20, categories: ["Work", "Personal", "Health", "Learning", "Other"], analytics: false } },
@@ -119,11 +124,24 @@ function Auth({ onAuth, onBack }) {
 function Pricing({ user, onSelectPlan }) {
   const [billing, setBilling] = useState("month");
   const [loading, setLoading] = useState(null);
+  const [error, setError] = useState("");
   const selectPlan = async (planId) => {
-    setLoading(planId);
-    await supa.upsertSub({ user_id: user.id, plan: planId, billing }, user.token);
-    setLoading(null);
-    onSelectPlan(planId, billing);
+    setError(""); setLoading(planId);
+    if (planId === "free") {
+      await supa.upsertSub({ user_id: user.id, plan: planId, billing }, user.token);
+      setLoading(null); onSelectPlan(planId, billing); return;
+    }
+    try {
+      const priceId = STRIPE_PRICES[planId][billing];
+      const baseUrl = window.location.origin;
+      const res = await fetch("/api/create-checkout", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ priceId, userId: user.id, userEmail: user.email, successUrl: `${baseUrl}/?payment=success&plan=${planId}&billing=${billing}&userId=${user.id}`, cancelUrl: `${baseUrl}/?payment=cancelled` }),
+      });
+      const data = await res.json();
+      if (data.error) { setError(data.error); setLoading(null); return; }
+      window.location.href = data.url;
+    } catch (e) { setError("Payment error: " + e.message); setLoading(null); }
   };
   return (
     <div style={{ minHeight: "100vh", background: "#0D0F14", color: "#E8E2D9", fontFamily: "Georgia,serif", padding: "48px 20px" }}>
@@ -139,6 +157,7 @@ function Pricing({ user, onSelectPlan }) {
             </button>
           ))}
         </div>
+        {error && <div style={{ color: "#C94A4A", fontSize: 13, marginTop: 16 }}>{error}</div>}
       </div>
       <div style={{ display: "flex", gap: 14, maxWidth: 940, margin: "0 auto", flexWrap: "wrap", justifyContent: "center" }}>
         {Object.values(PLANS).map((plan, i) => {
@@ -154,13 +173,13 @@ function Pricing({ user, onSelectPlan }) {
                 {plan.features.map(f => <div key={f} style={{ display: "flex", gap: 8, fontSize: 12, color: "#B0A898" }}><span style={{ color: plan.color, flexShrink: 0 }}>✓</span>{f}</div>)}
               </div>
               <button onClick={() => selectPlan(plan.id)} disabled={loading === plan.id} style={{ padding: "11px", background: plan.id === "recommended" ? "#C9914A" : plan.id === "premium" ? "#5A8FC9" : "#2E3244", color: plan.id === "free" ? "#B0A898" : "#0D0F14", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "Georgia,serif", fontSize: 13, fontWeight: 700, opacity: loading === plan.id ? 0.6 : 1 }}>
-                {loading === plan.id ? "Saving…" : plan.id === "free" ? "Start Free" : `Choose ${plan.label} →`}
+                {loading === plan.id ? (plan.id === "free" ? "Saving…" : "Redirecting…") : plan.id === "free" ? "Start Free" : `Choose ${plan.label} →`}
               </button>
             </div>
           );
         })}
       </div>
-      <div style={{ textAlign: "center", marginTop: 32, fontSize: 11, color: "#3E4154" }}>🔒 Cancel anytime · No hidden fees</div>
+      <div style={{ textAlign: "center", marginTop: 32, fontSize: 11, color: "#3E4154" }}>🔒 Secure payment via Stripe · Cancel anytime</div>
     </div>
   );
 }
@@ -362,12 +381,36 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [plan, setPlan] = useState(null);
   const [billing, setBilling] = useState(null);
-  const handleAuth = (u, next, p, b) => { setUser(u); if (p) { setPlan(p); setBilling(b); } setScreen(next); };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const payment = params.get("payment");
+    const paidPlan = params.get("plan");
+    const paidBilling = params.get("billing");
+    if (payment === "success" && paidPlan) {
+      window.history.replaceState({}, "", "/");
+      setPlan(paidPlan); setBilling(paidBilling); setScreen("auth");
+    } else if (payment === "cancelled") {
+      window.history.replaceState({}, "", "/");
+    }
+  }, []);
+
+  const handleAuth = async (u, next, p, b) => {
+    setUser(u);
+    if (plan && !p) {
+      await supa.upsertSub({ user_id: u.id, plan, billing }, u.token);
+      setScreen("app"); return;
+    }
+    if (p) { setPlan(p); setBilling(b); }
+    setScreen(next);
+  };
+
   const handleSignOut = async () => { if (user?.token) await supa.signOut(user.token); setUser(null); setPlan(null); setBilling(null); setScreen("landing"); };
+
   return (
     <div style={{ width: "100vw", height: "100vh" }}>
       {screen === "landing" && <Landing onGetStarted={() => setScreen("auth")} />}
-      {screen === "auth" && <Auth onAuth={handleAuth} onBack={() => setScreen("landing")} />}
+      {screen === "auth" && <Auth onAuth={handleAuth} onBack={() => { setScreen("landing"); setPlan(null); setBilling(null); }} />}
       {screen === "pricing" && user && <Pricing user={user} onSelectPlan={(p, b) => { setPlan(p); setBilling(b); setScreen("app"); }} />}
       {screen === "app" && user && plan && <TaskApp user={user} plan={plan} billing={billing} onUpgrade={() => setScreen("pricing")} onSignOut={handleSignOut} />}
     </div>
